@@ -3,6 +3,15 @@
 This is the PKCS#11 implementation of the
 [KMS interface](https://github.com/openbao/go-kms-wrapping/tree/main/kms).
 
+## RSA signatures
+
+RSA keys support PKCS#1 v1.5 and PSS signatures over SHA-224, SHA-256,
+SHA-384 and SHA-512, accepting either messages or pre-hashed digests.
+Use `*rsa.PSSOptions` for PSS, or a `crypto.Hash` for PKCS#1 v1.5.
+The optional `GetKey` configuration parameter `mechanism` can pin a key to
+`CKM_RSA_PKCS` (PKCS#1 v1.5) or `CKM_RSA_PKCS_PSS`; signing and verification
+reject options selecting a different scheme.
+
 ## Tests
 
 Tests in this module are set up to run against a given PKCS#11 library path,

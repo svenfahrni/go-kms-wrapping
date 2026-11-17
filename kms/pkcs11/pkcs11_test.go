@@ -46,6 +46,18 @@ func NewTestKMS(t *testing.T, configs ...kms.ConfigMap) *pkcs11KMS {
 	return svc
 }
 
+func TestParseRSAPKCSMechanism(t *testing.T) {
+	for _, name := range []string{"CKM_RSA_PKCS", "ckm_rsa_pkcs", "rsa-pkcs", "RSA_PKCS", "1", "0x1"} {
+		t.Run(name, func(t *testing.T) {
+			mechanism, err := parseMechanism(name)
+			require.NoError(t, err)
+			require.NotNil(t, mechanism)
+			require.Equal(t, uint(pkcs11.CKM_RSA_PKCS), *mechanism)
+			require.Equal(t, "CKM_RSA_PKCS", mechToString(*mechanism))
+		})
+	}
+}
+
 func TestOpen(t *testing.T) {
 	ctx := t.Context()
 
