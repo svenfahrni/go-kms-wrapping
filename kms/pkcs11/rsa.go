@@ -8,6 +8,8 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"errors"
 	"fmt"
 	"math/big"
@@ -29,7 +31,7 @@ func newRSA(
 		switch *mech {
 		// pkcs11.CKM_SHA{X}_RSA_PKCS_PSS variants can be added in the future if
 		// there is desire for remote message hashing.
-		case pkcs11.CKM_RSA_PKCS_PSS, pkcs11.CKM_RSA_PKCS_OAEP:
+		case pkcs11.CKM_RSA_PKCS, pkcs11.CKM_RSA_PKCS_PSS, pkcs11.CKM_RSA_PKCS_OAEP:
 		default:
 			return nil, fmt.Errorf("unsupported RSA key mechanism: %x", *mech)
 		}
@@ -101,12 +103,15 @@ type rsaKey struct {
 	disableSoftwareEncryption bool
 }
 
-var rsaLookup = map[crypto.Hash]struct{ hash, mgf uint }{
-	crypto.SHA1:   {pkcs11.CKM_SHA_1, pkcs11.CKG_MGF1_SHA1},
-	crypto.SHA224: {pkcs11.CKM_SHA224, pkcs11.CKG_MGF1_SHA224},
-	crypto.SHA256: {pkcs11.CKM_SHA256, pkcs11.CKG_MGF1_SHA256},
-	crypto.SHA384: {pkcs11.CKM_SHA384, pkcs11.CKG_MGF1_SHA384},
-	crypto.SHA512: {pkcs11.CKM_SHA512, pkcs11.CKG_MGF1_SHA512},
+var rsaLookup = map[crypto.Hash]struct {
+	hash, mgf uint
+	oid       asn1.ObjectIdentifier
+}{
+	crypto.SHA1:   {pkcs11.CKM_SHA_1, pkcs11.CKG_MGF1_SHA1, asn1.ObjectIdentifier{1, 3, 14, 3, 2, 26}},
+	crypto.SHA224: {pkcs11.CKM_SHA224, pkcs11.CKG_MGF1_SHA224, asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 4}},
+	crypto.SHA256: {pkcs11.CKM_SHA256, pkcs11.CKG_MGF1_SHA256, asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}},
+	crypto.SHA384: {pkcs11.CKM_SHA384, pkcs11.CKG_MGF1_SHA384, asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 2}},
+	crypto.SHA512: {pkcs11.CKM_SHA512, pkcs11.CKG_MGF1_SHA512, asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 3}},
 }
 
 func (r *rsaKey) Encrypt(ctx context.Context, opts *kms.CipherOptions) ([]byte, error) {
@@ -155,7 +160,8 @@ func (r *rsaKey) Decrypt(ctx context.Context, opts *kms.CipherOptions) ([]byte, 
 
 func (r *rsaKey) Sign(ctx context.Context, opts *kms.SignOptions) ([]byte, error) {
 	// Check for pinned mechanism:
-	if r.mech != nil && *r.mech != pkcs11.CKM_RSA_PKCS_PSS {
+	mechanism := rsaSigningMechanism(opts.SignerOpts)
+	if r.mech != nil && *r.mech != mechanism {
 		return nil, fmt.Errorf("unsupported scheme: %x", *r.mech)
 	}
 
@@ -166,10 +172,11 @@ func (r *rsaKey) Sign(ctx context.Context, opts *kms.SignOptions) ([]byte, error
 		return nil, fmt.Errorf("unsupported hash function: %s", hash)
 	case hashMechs.hash == pkcs11.CKM_SHA_1:
 		// SHA-1 is supported via OAEP for compatibility with the PKCS#11 seal
-		// wrapper, but there's no reason to allow its usage via PSS.
-		return nil, errors.New("SHA-1 PSS signing is unsupported")
+		// wrapper, but there's no reason to allow its usage for signing.
+		return nil, errors.New("SHA-1 signing is unsupported")
 	}
 
+	mech := pkcs11.NewMechanism(mechanism, nil)
 	switch o := opts.SignerOpts.(type) {
 	case *rsa.PSSOptions:
 		switch o.SaltLength {
@@ -177,18 +184,37 @@ func (r *rsaKey) Sign(ctx context.Context, opts *kms.SignOptions) ([]byte, error
 		default:
 			return nil, errors.New("custom PSS salt lengths are not supported")
 		}
-	default:
-		return nil, errors.New("PKCS#1 v1.5 signing is not implemented")
+		mech = pkcs11.NewMechanism(mechanism,
+			pkcs11.NewPSSParams(hashMechs.hash, hashMechs.mgf, uint(hash.Size())))
 	}
-
-	mech := pkcs11.NewMechanism(pkcs11.CKM_RSA_PKCS_PSS,
-		pkcs11.NewPSSParams(hashMechs.hash, hashMechs.mgf, uint(hash.Size())))
 
 	data := opts.Data
 	if !opts.Prehashed {
 		h := opts.HashFunc().New()
 		_, _ = h.Write(data)
 		data = h.Sum(nil)
+	}
+	if len(data) != hash.Size() {
+		return nil, errors.New("input must be hashed with the specified hash function")
+	}
+
+	if mechanism == pkcs11.CKM_RSA_PKCS {
+		// CKM_RSA_PKCS adds the PKCS#1 v1.5 padding, but expects the caller
+		// to encode the digest and its algorithm as a DER DigestInfo.
+		var err error
+		data, err = asn1.Marshal(struct {
+			Algorithm pkix.AlgorithmIdentifier
+			Digest    []byte
+		}{
+			Algorithm: pkix.AlgorithmIdentifier{
+				Algorithm:  hashMechs.oid,
+				Parameters: asn1.NullRawValue,
+			},
+			Digest: data,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("encode DigestInfo: %w", err)
+		}
 	}
 
 	return session.Scope(ctx, r.pool, func(s *session.Handle) ([]byte, error) {
@@ -201,7 +227,7 @@ func (r *rsaKey) Sign(ctx context.Context, opts *kms.SignOptions) ([]byte, error
 
 func (r *rsaKey) Verify(ctx context.Context, opts *kms.VerifyOptions) error {
 	// Check for pinned mechanism:
-	if r.mech != nil && *r.mech != pkcs11.CKM_RSA_PKCS_PSS {
+	if r.mech != nil && *r.mech != rsaSigningMechanism(opts.SignerOpts) {
 		return fmt.Errorf("unsupported scheme: %x", *r.mech)
 	}
 
@@ -230,10 +256,19 @@ func (r *rsaKey) Verify(ctx context.Context, opts *kms.VerifyOptions) error {
 			return fmt.Errorf("%w: %w", kms.ErrInvalidSignature, err)
 		}
 	default:
-		return errors.New("PKCS#1 v1.5 verification is not implemented")
+		if err := rsa.VerifyPKCS1v15(pub, hash, data, opts.Signature); err != nil {
+			return fmt.Errorf("%w: %w", kms.ErrInvalidSignature, err)
+		}
 	}
 
 	return nil
+}
+
+func rsaSigningMechanism(opts crypto.SignerOpts) uint {
+	if _, ok := opts.(*rsa.PSSOptions); ok {
+		return pkcs11.CKM_RSA_PKCS_PSS
+	}
+	return pkcs11.CKM_RSA_PKCS
 }
 
 func (r *rsaKey) ExportPublic(ctx context.Context) (crypto.PublicKey, error) {

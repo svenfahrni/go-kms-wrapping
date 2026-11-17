@@ -424,6 +424,8 @@ func parseMechanism(s string) (*uint, error) {
 		ret = pkcs11.CKM_AES_GCM
 	case "ecdsa":
 		ret = pkcs11.CKM_ECDSA
+	case "rsa-pkcs":
+		ret = pkcs11.CKM_RSA_PKCS
 	case "rsa-pkcs-pss":
 		ret = pkcs11.CKM_RSA_PKCS_PSS
 	case "rsa-pkcs-oaep":
@@ -450,6 +452,8 @@ func mechToString(mech uint) string {
 		return "CKM_AES_GCM"
 	case pkcs11.CKM_ECDSA:
 		return "CKM_ECDSA"
+	case pkcs11.CKM_RSA_PKCS:
+		return "CKM_RSA_PKCS"
 	case pkcs11.CKM_RSA_PKCS_PSS:
 		return "CKM_RSA_PKCS_PSS"
 	case pkcs11.CKM_RSA_PKCS_OAEP:

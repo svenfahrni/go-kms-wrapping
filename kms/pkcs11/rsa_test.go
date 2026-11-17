@@ -8,8 +8,10 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"fmt"
 	"testing"
 
+	"github.com/miekg/pkcs11"
 	"github.com/openbao/go-kms-wrapping/kms/pkcs11/v2/internal/keybuilder"
 	"github.com/openbao/go-kms-wrapping/kms/pkcs11/v2/internal/session"
 	"github.com/openbao/go-kms-wrapping/v2/kms"
@@ -155,6 +157,172 @@ func TestPSS(t *testing.T) {
 				err = cert.CheckSignatureFrom(cert)
 				require.NoError(t, err)
 			})
+		})
+	}
+}
+
+func TestPKCS1v15(t *testing.T) {
+	ctx := t.Context()
+	svc := NewTestKMS(t)
+
+	label := rand.Text()
+	require.NoError(t, svc.pool.Scope(ctx, func(s *session.Handle) error {
+		_, _, err := s.GenerateKeyPair(keybuilder.RSA(2048).Label(label).Build())
+		return err
+	}))
+
+	for _, mechanism := range []string{"", "CKM_RSA_PKCS"} {
+		name := mechanism
+		if name == "" {
+			name = "unpinned"
+		}
+		t.Run(name, func(t *testing.T) {
+			config := kms.ConfigMap{"label": label}
+			if mechanism != "" {
+				config["mechanism"] = mechanism
+			}
+			key, err := svc.GetKey(ctx, &kms.KeyOptions{ConfigMap: config})
+			require.NoError(t, err)
+			public, err := key.ExportPublic(ctx)
+			require.NoError(t, err)
+			pub := public.(*rsa.PublicKey)
+
+			for _, hash := range []crypto.Hash{crypto.SHA224, crypto.SHA256, crypto.SHA384, crypto.SHA512} {
+				t.Run(hash.String(), func(t *testing.T) {
+					message := []byte("PKCS#1 v1.5 signing")
+					h := hash.New()
+					_, _ = h.Write(message)
+					digest := h.Sum(nil)
+
+					signature, err := key.Sign(ctx, &kms.SignOptions{
+						Data:       message,
+						SignerOpts: hash,
+					})
+					require.NoError(t, err)
+					require.Len(t, signature, pub.Size())
+					// Check the token's DigestInfo encoding against the standard
+					// library, independently of the provider's Verify method.
+					require.NoError(t, rsa.VerifyPKCS1v15(pub, hash, digest, signature))
+					require.NoError(t, key.Verify(ctx, &kms.VerifyOptions{
+						Data:       message,
+						SignerOpts: hash,
+						Signature:  signature,
+					}))
+
+					prehashed, err := key.Sign(ctx, &kms.SignOptions{
+						Data:       digest,
+						Prehashed:  true,
+						SignerOpts: hash,
+					})
+					require.NoError(t, err)
+					// PKCS#1 v1.5 signatures are deterministic.
+					require.Equal(t, signature, prehashed)
+					require.NoError(t, key.Verify(ctx, &kms.VerifyOptions{
+						Data:       digest,
+						Prehashed:  true,
+						SignerOpts: hash,
+						Signature:  prehashed,
+					}))
+
+					t.Run("invalid signatures", func(t *testing.T) {
+						altered := append([]byte(nil), signature...)
+						altered[len(altered)-1] ^= 1
+						for _, bad := range [][]byte{nil, signature[:len(signature)-1], altered} {
+							require.ErrorIs(t, key.Verify(ctx, &kms.VerifyOptions{
+								Data:       message,
+								SignerOpts: hash,
+								Signature:  bad,
+							}), kms.ErrInvalidSignature)
+						}
+						require.ErrorIs(t, key.Verify(ctx, &kms.VerifyOptions{
+							Data:       []byte("changed message"),
+							SignerOpts: hash,
+							Signature:  signature,
+						}), kms.ErrInvalidSignature)
+						for _, length := range []int{0, hash.Size() - 1, hash.Size() + 1} {
+							require.Error(t, key.Verify(ctx, &kms.VerifyOptions{
+								Data:       make([]byte, length),
+								Prehashed:  true,
+								SignerOpts: hash,
+								Signature:  signature,
+							}))
+						}
+					})
+				})
+			}
+
+			for _, algorithm := range []x509.SignatureAlgorithm{x509.SHA256WithRSA, x509.SHA384WithRSA, x509.SHA512WithRSA} {
+				t.Run(algorithm.String(), func(t *testing.T) {
+					signer, err := kms.NewSigner(ctx, key)
+					require.NoError(t, err)
+					template := &x509.Certificate{
+						IsCA:                  true,
+						BasicConstraintsValid: true,
+						SignatureAlgorithm:    algorithm,
+					}
+					der, err := x509.CreateCertificate(rand.Reader, template, template, signer.Public(), signer)
+					require.NoError(t, err)
+					cert, err := x509.ParseCertificate(der)
+					require.NoError(t, err)
+					require.NoError(t, cert.CheckSignatureFrom(cert))
+				})
+			}
+		})
+	}
+}
+
+func TestRSASignInvalidOptions(t *testing.T) {
+	// A missing pool ensures invalid inputs are rejected before a token call.
+	key := &rsaKey{}
+	for _, pss := range []bool{false, true} {
+		t.Run(fmt.Sprintf("PSS=%t", pss), func(t *testing.T) {
+			optsForHash := func(hash crypto.Hash) crypto.SignerOpts {
+				if pss {
+					return &rsa.PSSOptions{Hash: hash}
+				}
+				return hash
+			}
+			for _, hash := range []crypto.Hash{0, crypto.MD5, crypto.SHA1, crypto.SHA512_256} {
+				t.Run(hash.String(), func(t *testing.T) {
+					_, err := key.Sign(t.Context(), &kms.SignOptions{
+						Data:       []byte("message"),
+						SignerOpts: optsForHash(hash),
+					})
+					require.Error(t, err)
+				})
+			}
+			for _, hash := range []crypto.Hash{crypto.SHA224, crypto.SHA256, crypto.SHA384, crypto.SHA512} {
+				for _, length := range []int{0, hash.Size() - 1, hash.Size() + 1} {
+					t.Run(fmt.Sprintf("%s/%d", hash, length), func(t *testing.T) {
+						_, err := key.Sign(t.Context(), &kms.SignOptions{
+							Data:       make([]byte, length),
+							Prehashed:  true,
+							SignerOpts: optsForHash(hash),
+						})
+						require.Error(t, err)
+					})
+				}
+			}
+		})
+	}
+}
+
+func TestRSAMechanismMismatch(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		mech uint
+		opts crypto.SignerOpts
+	}{
+		{"PSS rejects PKCS1v15", pkcs11.CKM_RSA_PKCS_PSS, crypto.SHA256},
+		{"PKCS1v15 rejects PSS", pkcs11.CKM_RSA_PKCS, &rsa.PSSOptions{Hash: crypto.SHA256}},
+		{"OAEP rejects PKCS1v15", pkcs11.CKM_RSA_PKCS_OAEP, crypto.SHA256},
+		{"OAEP rejects PSS", pkcs11.CKM_RSA_PKCS_OAEP, &rsa.PSSOptions{Hash: crypto.SHA256}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			key := &rsaKey{mech: &tt.mech}
+			_, err := key.Sign(t.Context(), &kms.SignOptions{SignerOpts: tt.opts})
+			require.Error(t, err)
+			require.Error(t, key.Verify(t.Context(), &kms.VerifyOptions{SignerOpts: tt.opts}))
 		})
 	}
 }
